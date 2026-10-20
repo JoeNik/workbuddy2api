@@ -216,6 +216,52 @@ func TestChatAGlobalPathReuseConvReqID(t *testing.T) {
 	}
 }
 
+// TestChatGlobalConversationPlaceholderHeaders global realm 端到端：国际版上游
+// 对三大会话头强校验（占位 "-"，见 upstream.conversationPlaceholder）——即便
+// body 带 conversation_id、入站带 X-Conversation-Request-ID，global 出站三头
+// 仍恒为 "-"（原来是透传/生成值 → 上游 400 code 11128「请求被拦截」）。
+// B3 链路族保持完整（无 realm 差异）。
+func TestChatGlobalConversationPlaceholderHeaders(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+
+	var captured http.Header
+	up := &upstream.Client{
+		GlobalEnabled: true,
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			captured = r.Header.Clone()
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN:     "https://fake.example",
+		ChatBaseGlobal: "https://fake.example",
+		BillingBaseCN:  "https://fake.example",
+	}
+	a := &auth.Auth{UID: "g1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"}
+	p := testPoolWith(a)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"global:glm-5.2","messages":[],"conversation_id":"conv-1"}`))
+	req.Header.Set("X-Conversation-Request-ID", "client-req-1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	for _, h := range []string{"X-Conversation-ID", "X-Conversation-Request-ID", "X-Conversation-Message-ID"} {
+		if got := captured.Get(h); got != "-" {
+			t.Errorf("global %s = %q want placeholder %q (intl 11128 gate)", h, got, "-")
+		}
+	}
+	if captured.Get("X-B3-TraceId") == "" || captured.Get("X-B3-SpanId") == "" {
+		t.Errorf("global B3 family missing: trace=%q span=%q",
+			captured.Get("X-B3-TraceId"), captured.Get("X-B3-SpanId"))
+	}
+}
+
 // isValidB3Trace 16/32 hex 校验（避免重复断言逻辑）。
 func isValidB3Trace(s string) bool {
 	if len(s) != 16 && len(s) != 32 {

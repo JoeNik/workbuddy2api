@@ -143,6 +143,81 @@ func TestDefaultWorkBuddyUAForGlobal(t *testing.T) {
 	}
 }
 
+// TestChatHeadersGlobalConversationPlaceholder global（国际版）会话头族修复：
+// workbuddy.ai 上游 2026-10 起对 X-Conversation-ID / X-Conversation-Request-ID /
+// X-Conversation-Message-ID 三头强校验——官方 Web 客户端即送占位 "-"，缺失头
+// （无 conversation_id 的 OpenAI 兼容客户端）或任意生成值一律 400 code 11128
+// "request illegal"（「请求被拦截，请重新发送」）。故 global 出站三头恒定 "-"
+// （即便 meta 带了真实 conversationID / conversationRequestID 也被覆写）；
+// 消息级/链路族（X-Request-ID / X-Root-Request-ID / X-Trace-ID / X-B3-*）无
+// realm 差异，维持生成语义。
+func TestChatHeadersGlobalConversationPlaceholder(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "g1", Domain: "www.workbuddy.ai"}
+	req := mustRequest(t)
+	c := &Client{}
+	c.ChatHeaders(req, a, "", ChatMeta{
+		ConversationID:        "conv-1",
+		ConversationRequestID: "0123456789abcdef0123456789abcdef",
+		TraceID:               "trace-inbound",
+	})
+
+	for _, h := range []string{"X-Conversation-ID", "X-Conversation-Request-ID", "X-Conversation-Message-ID"} {
+		if got := req.Header.Get(h); got != "-" {
+			t.Errorf("global %s = %q want placeholder %q (intl upstream 11128 gate)", h, got, "-")
+		}
+	}
+	// 链路/消息族保持生成语义（上游仅拦截 X-Conversation-* 三头）。
+	msgID := req.Header.Get("X-Request-ID")
+	if !hex32Re.MatchString(msgID) {
+		t.Errorf("X-Request-ID = %q want 32 hex", msgID)
+	}
+	if got := req.Header.Get("X-Root-Request-ID"); got != "0123456789abcdef0123456789abcdef" {
+		t.Errorf("X-Root-Request-ID = %q want convReqID", got)
+	}
+	if got := req.Header.Get("X-Trace-ID"); got != "trace-inbound" {
+		t.Errorf("X-Trace-ID = %q want trace-inbound (passthrough)", got)
+	}
+	if got := req.Header.Get("X-B3-TraceId"); got != "0123456789abcdef0123456789abcdef" {
+		t.Errorf("X-B3-TraceId = %q want convReqID (32 hex)", got)
+	}
+	if !hex16Re.MatchString(req.Header.Get("X-B3-SpanId")) {
+		t.Errorf("X-B3-SpanId = %q want 16 hex", req.Header.Get("X-B3-SpanId"))
+	}
+	// global 指纹头零回归（三件套仍在）。
+	if got := req.Header.Get("User-Agent"); got != globalUAString {
+		t.Errorf("global UA = %q want %q", got, globalUAString)
+	}
+	if got := req.Header.Get("X-No-Enterprise-Id"); got != "1" {
+		t.Errorf("X-No-Enterprise-Id = %q want 1", got)
+	}
+	if got := req.Header.Get("X-Domain"); got != "www.workbuddy.ai" {
+		t.Errorf("X-Domain = %q want www.workbuddy.ai", got)
+	}
+}
+
+// TestChatHeadersCNConversationZeroRegression CN 账号会话头族零回归：既有
+// 透传/生成语义（不因 global 修复改道）——X-Conversation-ID 透传 meta 原值、
+// X-Conversation-Request-ID 为聚合主键、消息级 ID 32 hex。
+func TestChatHeadersCNConversationZeroRegression(t *testing.T) {
+	a := &auth.Auth{AccessToken: "at", UID: "c1"}
+	req := mustRequest(t)
+	c := &Client{}
+	c.ChatHeaders(req, a, "", ChatMeta{
+		ConversationID:        "conv-1",
+		ConversationRequestID: "0123456789abcdef0123456789abcdef",
+	})
+
+	if got := req.Header.Get("X-Conversation-ID"); got != "conv-1" {
+		t.Errorf("CN X-Conversation-ID = %q want conv-1 (passthrough)", got)
+	}
+	if got := req.Header.Get("X-Conversation-Request-ID"); got != "0123456789abcdef0123456789abcdef" {
+		t.Errorf("CN X-Conversation-Request-ID = %q want convReqID (aggregation key)", got)
+	}
+	if mid := req.Header.Get("X-Conversation-Message-ID"); !hex32Re.MatchString(mid) {
+		t.Errorf("CN X-Conversation-Message-ID = %q want 32 hex", mid)
+	}
+}
+
 // mustRequest 构造一个无 body 的 POST 请求（测试 ChatHeaders 用）。
 func mustRequest(t *testing.T) *http.Request {
 	t.Helper()

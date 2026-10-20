@@ -206,9 +206,11 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
 // handler 在轮转循环外生成 conversationID / conversationRequestID，循环内每次出站
 // 复用同值；TraceID 透传入站值（空 = 回落 conversationRequestID）。
 // messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
+// 注意：global realm 出站时 X-Conversation-* 三头被固定覆写为占位 "-"
+// （国际版上游强校验，见 conversationPlaceholder），本结构字段对 global 不生效。
 type ChatMeta struct {
-	ConversationID        string // X-Conversation-ID：body 提取的入站值，空则不发（透传优先，不伪造）
-	ConversationRequestID string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发
+	ConversationID        string // X-Conversation-ID：body 提取的入站值，空则不发（透传优先，不伪造；global 恒 "-"）
+	ConversationRequestID string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发（global 下 X-Conversation-Request-ID 恒 "-"）
 	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
 }
 
@@ -216,7 +218,8 @@ type ChatMeta struct {
 // 缺省字段用 X-No-* 约定（与 CodeBuddy 官方 CLI 一致）。
 // clientIP 为本次请求的客户端 IP（按参数传递，不读共享字段——避免并发串扰）；
 // PassthroughIP=false 或 clientIP 为空时不注入 IP 头。
-// meta 为会话头族元数据（CN/global 同构，纯新增，不改既有头），见 injectConversationHeaders。
+// meta 为会话头族元数据（CN 透传/生成；global realm 下三大会话头被固定为占位
+// "-" 覆写，见 injectConversationHeaders）。
 func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, meta ChatMeta) {
 	c.CommonHeaders(req, a)
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
@@ -262,12 +265,23 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	c.injectClientIP(req, clientIP)
 	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入（见 resolveDeviceToken）。
 	c.injectDeviceToken(req, a)
-	// 会话头族（对话/请求/消息/B3 链路）：纯新增，CN/global 同构，见 injectConversationHeaders。
-	c.injectConversationHeaders(req, meta)
+	// 会话头族（对话/请求/消息/B3 链路）：CN 走透传/生成形态，global 三头
+	// 恒定占位 "-"（国际版上游 11128 强校验），见 injectConversationHeaders。
+	c.injectConversationHeaders(req, a, meta)
 }
 
+// conversationPlaceholder global（国际版）chat 三大会话头的占位值 "-"。
+// 2026-10 起 www.workbuddy.ai 上游对出站 chat 请求的 X-Conversation-ID /
+// X-Conversation-Request-ID / X-Conversation-Message-ID 做强校验：官方 Web 客户端
+// 正常请求三头恒为 "-"（无值占位）；缺失头（如 OpenAI 兼容客户端不带
+// conversation_id → 网关原来整个头省掉）或任意生成/伪造值，一律被上游拒为
+// 400 code 11128 "request illegal"（displayMsg「请求被拦截，请重新发送」）。
+// CN 侧 codebuddy.cn 无该校验，保持既有透传/生成形态（见 injectConversationHeaders
+// 的 realm 分流）。
+const conversationPlaceholder = "-"
+
 // injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合）。
-// 头族分四层，各司其职：
+// 头族分四层，各司其职（CN 形态）：
 //   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。空则不发——
 //     透传客户端原值优先，客户端没给就不伪造，避免误导后台建错会话。
 //   - X-Conversation-Request-ID：**对话轮级聚合主键**，必发。一次 user send 内的
@@ -280,7 +294,12 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 //   - X-B3-TraceId / X-B3-SpanId / X-B3-Sampled：链路族。B3 规范只认 16/32 hex
 //     TraceId 与 16 hex SpanId；入站 conversationRequestID 非法时 TraceId 回落
 //     messageID（恒 32 hex），SpanId 取 messageID[:16]（每消息新）。
-func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
+//
+// realm 分流（global 修复）：国际版上游 2026-10 起对 X-Conversation-* 三头做强
+// 校验（见 conversationPlaceholder），global 出站三头恒定占位 "-"（不透传不
+// 生成）；消息级/链路族（X-Request-ID / X-Root-Request-ID / X-Trace-ID /
+// X-B3-*）无 realm 差异，维持原生成语义。
+func (c *Client) injectConversationHeaders(req *http.Request, a *auth.Auth, meta ChatMeta) {
 	convReqID := meta.ConversationRequestID
 	if convReqID == "" {
 		// 零值 meta（直接调 ChatHeaders 的调用方/测试）也要保证聚合主键必发：
@@ -288,11 +307,20 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 		convReqID = session.NewMessageID()
 	}
 	messageID := session.NewMessageID()
-	if meta.ConversationID != "" {
-		req.Header.Set("X-Conversation-ID", meta.ConversationID)
+	if a != nil && a.IsGlobal() {
+		// global（国际版）：三大会话头送官方 Web 客户端占位 "-"。真实值/缺失均被
+		// workbuddy.ai 上游 400 code 11128 拦截（「请求被拦截，请重新发送」），
+		// 故不透传 meta.ConversationID、不生成聚合/消息 ID——对齐实测可用请求。
+		req.Header.Set("X-Conversation-ID", conversationPlaceholder)
+		req.Header.Set("X-Conversation-Request-ID", conversationPlaceholder)
+		req.Header.Set("X-Conversation-Message-ID", conversationPlaceholder)
+	} else {
+		if meta.ConversationID != "" {
+			req.Header.Set("X-Conversation-ID", meta.ConversationID)
+		}
+		req.Header.Set("X-Conversation-Request-ID", convReqID)
+		req.Header.Set("X-Conversation-Message-ID", messageID)
 	}
-	req.Header.Set("X-Conversation-Request-ID", convReqID)
-	req.Header.Set("X-Conversation-Message-ID", messageID)
 	req.Header.Set("X-Request-ID", messageID)
 	req.Header.Set("X-Root-Request-ID", convReqID)
 	traceID := meta.TraceID
