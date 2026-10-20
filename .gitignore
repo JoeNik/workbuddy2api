@@ -35,6 +35,8 @@ draft_*_folder/
 
 # Backups (contains auth tokens)
 backups/
+*.bak
+*.bak.*
 
 # IDE
 .idea/
