@@ -137,6 +137,20 @@ func isInvalidImageData(body string) bool {
 		strings.Contains(lower, "replace the image")
 }
 
+// HasCodeMarker 包外判据入口（server 侧 applyErrorPolicy 按 code 分野用）：按 codeMarker
+// 的空白/引号容差在原文里找业务码，内部自行转小写。
+//
+// 存在的理由是「同一条 msg 骑不同 code」：上游的 `request illegal` 同时承载三种语义——
+//   - code 11140（数字）        → auth_forbidden 账号级授权风控（需重新 OAuth）；
+//   - code "11-128"（字符串）    → 渠道校验拦截（displayTips 自述「请用官方客户端重新发送」）；
+//   - code 11128（数字）        → 请求级拦截（displayMsg「请求被拦截，请重新发送」）。
+//
+// 只按 msg 字面量匹配就无法区分「该换号」和「该重发」，这正是旧实现把健康账号永久
+// 禁用（Disable）的原因。判定口径与 Classify 的 code 判定共用 codeMarker，不写第二份。
+func HasCodeMarker(body, code string) bool {
+	return codeMarker(strings.ToLower(body), strings.ToLower(code))
+}
+
 // codeMarker JSON code 字段命中（`"code":N` / `"code": N` / `"code":"N"` 形态，
 // 与 IsModelBlocked 的 code 判定同容差口径）。lower 须为小写 body。
 func codeMarker(lower, code string) bool {

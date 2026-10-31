@@ -1073,16 +1073,30 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
 	case upstream.ErrAccountFault:
-		// 账号级授权/配额故障按 msg 分野（口径与 Classify 的 accountFaultMarkers 一致）：
-		//   - "request illegal"（code 11140）→ 账号级**授权封禁**：软冷却到期也不会自动
-		//     恢复（需重新 OAuth 登录），到期后重新选号只会再撞 403 浪费一次轮换——
+		// 账号级授权/配额故障按 **code** 分野，不再只看 msg 字面量。
+		//
+		// 上游的 `request illegal` 是三种语义共用的 msg（判据见 upstream.HasCodeMarker）：
+		//   - code 11140（数字）→ auth/auth_forbidden 账号级**授权风控**：软冷却到期也不会
+		//     自愈（需重新 OAuth 登录），到期后重新选号只会再撞 403 浪费一次轮换——
 		//     硬禁用（Disable），不再参与选号。/status 以 disabled + disabled_reason 呈现。
+		//   - code "11-128"（字符串）→ **渠道校验拦截**：displayTips 原文「渠道校验失败，
+		//     可能不是从官方客户端发出的，请用官方客户端重新发送」——请求级可重试信号。
+		//   - code 11128（数字）→ **请求级拦截**：displayMsg 原文「请求被拦截，请重新发送」
+		//     （2026-10 国际版 400 日志实测形态，与本仓此前的误禁用同源）。
+		// 后两者硬禁用等于因为一条被拦的**请求**把凭证/余额都正常的号永久踢出池子
+		// （还要人工解冻）。两个误判方向的代价不对称：误禁用=永久丢号+人工介入，
+		// 误软冷却=一次白打的上游请求 + 退避自愈，故只有 11140 有资格硬禁用。
 		//   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
 		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
-		// 两条路径对坏号都立刻换号（同一请求轮转出池），只是后续可恢复性不同。
 		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
 		if strings.Contains(strings.ToLower(body), "request illegal") {
-			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
+			if upstream.HasCodeMarker(body, "11140") {
+				h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
+				return
+			}
+			// 无 11140 正面证据（11-128 / 11128 / 未知 code）→ 软冷却轮换，不永久禁用。
+			h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, time.Time{},
+				"request-level block (11-128/11128 request illegal), retryable")
 			return
 		}
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (14017)")
