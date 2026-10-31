@@ -5,7 +5,6 @@ package scheduler
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -416,9 +416,14 @@ func joinDetail(existing, add string) string {
 // CN 与 global 账号**都上报**（PR #45 实测国际版 /v2/report 可用）；单账号失败
 // 只记 WARN 不影响遍历。
 //
-// 每号上报 N 条（ActivityReportCount，默认 5）：N 条共用同一 conversationId
-// （wb2api-<ms>），模拟同一会话内 N 轮对话——这是领养猫（buddy/first）对话量
-// 门槛的实测刷法（chat_5 前置需 5 次对话）。requestId 各条独立（同会话多轮）。
+// 每号上报 N 条（ActivityReportCount，默认 5）：N 条共用同一 conversationId，
+// 模拟同一会话内 N 轮对话——这是领养猫（buddy/first）对话量门槛的实测刷法
+// （chat_5 前置需 5 次对话）。requestId 各条独立（同会话多轮）。
+//
+// conversationId / requestId 的**形态**必须是客户端同形（issue #51）：早前用
+// `wb2api-<ms>` / `<cid>-r<i>` 这种自带项目缩写的串，等于把「这是网关批量刷的」
+// 写在请求体里交给上游——一条正则就能筛出来。现在 conversationId 取 v7 UUID
+// （真机 X-Conversation-ID / conversationId 同形态），requestId 取 32 hex 随机。
 // 账号内 N 条之间间隔 activityReportGap（1.5s）避免秒发触发风控。
 //
 // 0/缺省 ActivityReportCount = 1 条，兼容旧行为（仅点亮连登 + 解锁 first_buddy）。
@@ -456,10 +461,11 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		}
 		first = false
 		// N 条共用同一 conversationId（同会话），requestId 各自独立（每条一个）。
-		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
+		// 形态对齐官方客户端：conversationId = UUIDv7，requestId = 32 hex 随机。
+		cid := session.NewTimeOrderedID()
 		ok := 0
 		for i := 1; i <= count; i++ {
-			rid := fmt.Sprintf("%s-r%d", cid, i)
+			rid := session.NewTraceID()
 			if err := s.cfg.Upstream.ReportChatActivity(a, cid, rid); err != nil {
 				log.Printf("activity %s: report %d/%d: %v", logfmt.Label(a.UID, a.Nickname), i, count, err)
 				break // 本号上报失败：不再续发，streak 自检无意义
