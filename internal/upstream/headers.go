@@ -181,6 +181,22 @@ func (c *Client) rpcUAFor(a *auth.Auth) string {
 	return brand + "/" + ver + " " + brand + "/" + ver + " CLI/" + c.cliVersion()
 }
 
+// v3ProbeUA /v3/config 目录探测的官方 UA（真机实测形态）：
+//
+//	CN 5.9.3     → WorkBuddy/5.9.3 CLI/2.165.0
+//	global 5.9.4 → WorkBuddy/5.9.4 CLI/2.165.0
+//
+// 两版都是**两段、单品牌**。旧实现在 CN 下发三段重复品牌（`WorkBuddy/<ver> WorkBuddy/<ver>
+// CLI/<cli>`）、在 global 下发 slug 首段，依据是 5.8.3 时代的抓包——同一账号同一 token 用
+// 三段 / 两段分别打 /v3/config，返回**逐字节相同**的 64866 字节（61 个模型、agents=cli/16），
+// 即 UA 家族对该端点已不再区分模型集合，三段式是遗留形态，而头形态本身仍可比对。
+func (c *Client) v3ProbeUA(a *auth.Auth) string {
+	if c != nil && c.UserAgent != "" {
+		return c.UserAgent
+	}
+	return "WorkBuddy/" + c.clientVersion(a) + " CLI/" + c.cliVersion()
+}
+
 // userAgent 返回 chat 链出站 UA。
 // 优先级：Client.UserAgent（config user_agent）显式覆盖 > 按账号 realm 的默认形态。
 func (c *Client) userAgent(a *auth.Auth) string {

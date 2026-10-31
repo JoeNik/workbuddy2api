@@ -227,3 +227,20 @@ func TestContractBilling(t *testing.T) {
 		},
 	})
 }
+
+// TestContractV3ProbeUA /v3/config 的 UA 恒为**两段单品牌**（两版真机同一形态）。
+// 三段重复品牌（CN 旧值）与 slug 首段（global 旧值）都不是该端点的形态。
+func TestContractV3ProbeUA(t *testing.T) {
+	c := &Client{}
+	if got := c.v3ProbeUA(&auth.Auth{}); got != "WorkBuddy/5.9.3 CLI/2.165.0" {
+		t.Errorf("CN v3 UA = %q want WorkBuddy/5.9.3 CLI/2.165.0", got)
+	}
+	if got := c.v3ProbeUA(&auth.Auth{Domain: "www.workbuddy.ai"}); got != "WorkBuddy/5.9.4 CLI/2.165.0" {
+		t.Errorf("global v3 UA = %q want WorkBuddy/5.9.4 CLI/2.165.0", got)
+	}
+	// 显式覆盖仍优先。
+	c2 := &Client{UserAgent: "Custom/1"}
+	if got := c2.v3ProbeUA(&auth.Auth{}); got != "Custom/1" {
+		t.Errorf("override v3 UA = %q want Custom/1", got)
+	}
+}

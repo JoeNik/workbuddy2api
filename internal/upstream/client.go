@@ -1431,9 +1431,12 @@ func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	// CommonHeaders 三段式 CLI UA 实测可通过 /v3/config 的 UA 门禁
-	// （Bearer + web UA → 400 code 12403，见 global-models-missing.md）。
+	// CommonHeaders 给的是 RPC 族 UA（CN 三段 / global slug 首段），但 /v3/config 真机
+	// 恒为**两段单品牌**（见 v3ProbeUA）：该端点由 RPC 层打，UA 家族对它不区分模型集合，
+	// 三段式是 5.8.3 时代的遗留形态。这里按真机形态覆盖。
+	// （Bearer + web UA → 400 code 12403，见 global-models-missing.md。）
 	c.CommonHeaders(req, a)
+	req.Header.Set("User-Agent", c.v3ProbeUA(a))
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	resp, err := c.HTTP.Do(req)
 	if err != nil {

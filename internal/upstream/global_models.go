@@ -310,7 +310,11 @@ func (c *Client) globalModelsOnce(a *auth.Auth, path string) ([]string, []ModelI
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	c.CommonHeaders(req, a) // 共享请求头（Origin/Referer/UA），与 FetchModels 同款
+	c.CommonHeaders(req, a) // 共享请求头（RPC 族 UA），与 FetchModels 同款
+	if path == v3ConfigPath {
+		// /v3/config 真机恒为两段单品牌 UA，见 v3ProbeUA。
+		req.Header.Set("User-Agent", c.v3ProbeUA(a))
+	}
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
