@@ -154,11 +154,14 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 // --- A 段：UA 对齐官方 WorkBuddy 三段式 ---
 
 const (
-	defaultUAString      = "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"
-	explicitString       = "MyCustomAgent/3.1"
-	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.137.1"
-	billingUAWorkBuddy   = "WorkBuddy/5.5.4"
-	billingUACustomVer   = "WorkBuddy/6.0.0"
+	// 版本段对齐当前分发包：CN 5.9.3 / CLI 2.165.0（旧值 5.5.4 / 2.137.1 已过期）。
+	defaultUAString   = "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"
+	explicitString    = "MyCustomAgent/3.1"
+	clientVerUAString = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.165.0"
+	// billing 域 UA 恒 axios：真机两版 billing 层（summary / packages / checkin /
+	// ambassador）发的都是 axios/1.16.1，与客户端自身 UA 无关（走 axios 实例而非 SDK）。
+	billingUAWorkBuddy   = "axios/1.16.1"
+	billingUACustomVer   = "axios/1.16.1"
 	billingUAAgentString = "BillingAgent/1"
 )
 
@@ -318,7 +321,7 @@ func TestBillingUA_WhenClientNameSaaS(t *testing.T) {
 	if ua != "" {
 		t.Errorf("billing UA = %q want empty (client_name=SaaS)", ua)
 	}
-	if got := c.billingUA(); got != "" {
+	if got := c.billingUA(a); got != "" {
 		t.Errorf("billingUA() = %q want empty", got)
 	}
 }

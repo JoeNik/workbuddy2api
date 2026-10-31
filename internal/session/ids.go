@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strings"
+	"time"
 )
 
 // ResolveConversationID 从请求体提取会话头族的 conversationId（snake/camel 双形态，
@@ -44,16 +45,93 @@ func ResolveConversationID(body []byte) string {
 	return strOrEmpty(obj["conversationId"])
 }
 
-// NewMessageID 生成消息级 ID：32 位 hex（UUID v4 去横线的长度形态），对齐官方
-// X-Request-ID / X-Conversation-Message-ID。crypto/rand 失败（理论上不可能）时回落
-// math/rand/v2 双 uint64 拼 32 hex——恒 32 hex、恒合法，可安全用作 B3 TraceId。
+// NewMessageID 生成消息级 ID：32 位 hex，**带毫秒时间前缀**（48 bit unix_ms + 80 bit 随机），
+// 对齐官方 X-Request-ID / X-Conversation-Message-ID 的实测形态。
+//
+// 为什么必须带时间位（issue #51，标识形态本身就是指纹）：官方真机样本
+// `01a160b2b722740da9b34be7d909a6ed`（国际版 5.8.4，2026-10-22 抓包）前 48 bit 解出
+// 1792623687458 ms，正是该次发送的时刻，且同会话内严格单调。旧实现是 16 字节纯随机 →
+// 同账号的多条请求按时间排序是乱的，构成一种可聚类的批次特征。
+//
+// crypto/rand 失败（理论上不可能）时回落 math/rand/v2 单 uint64，仍恒 32 hex、仍带时间位，
+// 可安全用作 B3 TraceId。
 func NewMessageID() string {
-	b := make([]byte, 16)
-	if _, err := cryptorand.Read(b); err == nil {
-		return hex.EncodeToString(b)
+	b := make([]byte, 10)
+	ms := time.Now().UnixMilli()
+	if _, err := cryptorand.Read(b); err != nil {
+		// 熵源故障的极端兜底：仍保证 32 hex（fallbackID 不 panic、不空串）。
+		return fmt.Sprintf("%012x%020x", ms, uint64(rand.Uint64())|1)
 	}
-	// 熵源故障的极端兜底：仍保证 32 hex（fallbackID 不 panic、不空串）。
-	return fmt.Sprintf("%016x%016x", uint64(rand.Uint64())|1, rand.Uint64())
+	return fmt.Sprintf("%012x%s", ms, hex.EncodeToString(b))
+}
+
+// NewConversationID 生成会话级标识：UUID v4 带横线（36 字符），对齐官方客户端
+// X-Conversation-ID 的实测形态（国际版 5.8.4 样本 9c0dca10-1110-4bd0-9bc0-9dc9f3440631）。
+//
+// 使用边界：**只给「网关自己发起的会话」**用（自动化任务上报体、面板批量动作等）。
+// 真实用户会话必须优先透传客户端声明的 conversationId——伪造会破坏后台按对话聚合。
+func NewConversationID() string {
+	var u [16]byte
+	if _, err := cryptorand.Read(u[:]); err != nil {
+		return NewMessageID() // 熵源故障兜底：32 hex，仍是合法 ID（形态退让，不 panic）
+	}
+	u[6] = (u[6] & 0x0f) | 0x40 // version 4
+	u[8] = (u[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
+}
+
+// NewTimeOrderedID 生成客户端同形态的**时间有序 UUID**（UUIDv7，36 字符带横线）。
+//
+// 依据（issue #51）：5.9.3 真机 X-Conversation-ID / acp-connection-id 形如
+// `01a1815d-dacf-75f1-8919-7f596025b9b3` —— 前 48 bit 解出 1793171774159 ms，恰是该次
+// 操作的时刻，第 13 位恒为 `7`，正是 UUIDv7（48 bit unix_ms + ver 7 + rand）。旧实现给
+// 这两处发 32 hex 无横线串或 v4 UUID，位布局与客户端不同（v4 无时间位，跨请求不可排序）。
+//
+// 布局：48 bit 时间戳 | 4 bit 版本(7) | 12 bit rand_a | 2 bit variant(10) | 62 bit rand_b。
+func NewTimeOrderedID() string {
+	var b [16]byte
+	ms := uint64(time.Now().UnixMilli())
+	b[0] = byte(ms >> 40)
+	b[1] = byte(ms >> 32)
+	b[2] = byte(ms >> 24)
+	b[3] = byte(ms >> 16)
+	b[4] = byte(ms >> 8)
+	b[5] = byte(ms)
+	if _, err := cryptorand.Read(b[6:]); err != nil {
+		// 熵源故障兜底：仍拼出合法 36 字符 v7 形态（后 10 字节取时间派生，不 panic）。
+		for i := 6; i < 16; i++ {
+			b[i] = byte(ms >> uint((i%6)*8))
+		}
+	}
+	b[6] = (b[6] & 0x0f) | 0x70 // version 7
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// NewTraceID 生成链路 trace ID：32 hex，**纯随机、不带时间位**。
+//
+// 与 NewMessageID 的区别是故意的：官方国际版 5.8.4 真机抓包里 X-Trace-ID / X-B3-TraceId
+// 恒为纯随机值（样本 0106b0ec1c2742bc830c18963b881a3f、0ece3294f88c4ec5a02e78547617f874，
+// 前 12 hex 解不出当前时刻），而同一请求的 X-Request-ID 才带毫秒前缀。两者都掺时间位
+// 就成了一种官方没有的规律。
+func NewTraceID() string {
+	b := make([]byte, 16)
+	if _, err := cryptorand.Read(b); err != nil {
+		return NewMessageID()
+	}
+	return hex.EncodeToString(b)
+}
+
+// NewSpanID 生成 16 hex 的链路 span ID，同样纯随机。
+//
+// 不能拿 messageID[:16] 顶替：messageID 现在带毫秒前缀，切片后 span 也会带上，
+// 而官方 span（样本 9795d0f16a68bd32 / 2d3e944e836647bb）与 trace、request 均无关系。
+func NewSpanID() string {
+	b := make([]byte, 8)
+	if _, err := cryptorand.Read(b); err != nil {
+		return fmt.Sprintf("%016x", uint64(rand.Uint64())|1)
+	}
+	return hex.EncodeToString(b)
 }
 
 // deriveSalt 进程启动随机盐：对所有稳定聚合 ID 的纯派生统一加盐，使派生值无法

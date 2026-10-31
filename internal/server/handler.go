@@ -618,7 +618,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//       也空走 NewMessageID 请求级（TurnRequestID 空键行为）——轮转内捕获
 	//       一次即共享。
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
-	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
+	chatMeta := upstream.ChatMeta{
+		ConversationID: session.ResolveConversationID(body),
+		// CacheKeyID：网关派生的粘性会话键。客户端没声明 conversationId 时，头族用它
+		// 派生 X-Conversation-ID / acp-connection-id（与 prompt_cache_key 同源，保证
+		// 「头里说的会话」与「缓存槽认的会话」是同一个）。空则头族现造 v7 UUID。
+		CacheKeyID: sessKey,
+	}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
 	} else if turnKey != "" && sessKey != "" {
@@ -635,6 +641,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		chatMeta.ConversationRequestID = session.TurnRequestID("")
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
+	// X-Root-Request-ID：会话级根，与轮级 ConversationRequestID 不是同一个值。
+	// 真机语义分层（根 vs 轮），旧实现让两族恒等——「恒等」本身就是网关自造的痕迹。
+	// 用独立 purpose 前缀派生，保证同会话稳定、跨会话不同、且绝不等于轮级键。
+	if sessKey != "" {
+		chatMeta.RootRequestID = session.RequestIDForKey("root|" + sessKey)
+	}
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。

@@ -2,9 +2,15 @@ package upstream
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+// uuidV4Re 官方会话标识形态：36 字符带横线 UUID v4（第 13 位恒 4、variant 段首位 8/9/a/b）。
+// issue #51：上游出站 X-Conversation-ID / prompt_cache_key 的会话段都是这个形态，
+// 带项目前缀或明文 uid 的串一眼就能被筛出来。
+var uuidV4Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 // extractCacheKey 从改写后的 body 里取出 prompt_cache_key 字段值。
 func extractCacheKey(t *testing.T, body []byte) string {
@@ -36,19 +42,19 @@ func TestInjectPromptCacheKey_PreservesExisting(t *testing.T) {
 
 // TestInjectPromptCacheKey_UsesConversationID 覆盖任务用例 2：
 // body 无 prompt_cache_key 但有 conversation_id → 用它做会话哈希源。
-// 格式 wb2a-<uid8>-<conversationHash>：conversation_id 不逐字出现，而是驱动哈希段
-// （同 id 同 key、不同 id 不同 key）。同时仍带 uid8 隔离前缀。
+// 格式为**官方同形 UUID v4**（36 字符带横线）：conversation_id 不逐字出现，而是驱动
+// 哈希段（同 id 同 key、不同 id 不同 key）；uid 只作为哈希输入参与隔离，**不明文出现**。
 func TestInjectPromptCacheKey_UsesConversationID(t *testing.T) {
 	uid := "user-abc-123"
 	in := `{"model":"glm-5.2","messages":[],"conversation_id":"conv-42"}`
 
 	out := InjectPromptCacheKey([]byte(in), uid, "")
 	got := extractCacheKey(t, out)
-	if !strings.HasPrefix(got, "wb2a-") {
-		t.Fatalf("expected wb2a- prefix, got=%q", got)
+	if !uuidV4Re.MatchString(got) {
+		t.Fatalf("expected UUID v4 shape, got=%q", got)
 	}
-	if !strings.Contains(got, "user-abc") {
-		t.Fatalf("expected uid8 isolation prefix, got=%q", got)
+	if strings.Contains(got, "user-abc") {
+		t.Fatalf("uid must not appear in plaintext, got=%q", got)
 	}
 	// 同 conversation_id 两次出站 → 同 key（稳定）。
 	out2 := InjectPromptCacheKey([]byte(in), uid, "")
@@ -89,23 +95,26 @@ func TestInjectPromptCacheKey_AccountIsolation(t *testing.T) {
 	if ka == kb {
 		t.Fatalf("cross-account key collision: both=%q", ka)
 	}
-	if !strings.HasPrefix(ka, "wb2a-") || !strings.HasPrefix(kb, "wb2a-") {
-		t.Fatalf("keys must carry wb2a- prefix: a=%q b=%q", ka, kb)
+	if !uuidV4Re.MatchString(ka) || !uuidV4Re.MatchString(kb) {
+		t.Fatalf("keys must be UUID v4 shape: a=%q b=%q", ka, kb)
 	}
 }
 
 // TestInjectPromptCacheKey_Format 覆盖任务用例 5：
-// cache key 格式校验（含 uid8 前缀）。
+// cache key 格式校验：官方同形 UUID v4，无项目前缀、无明文 uid（issue #51）。
 func TestInjectPromptCacheKey_Format(t *testing.T) {
 	uid := "1234567890abcdef"
 	in := `{"model":"glm-5.2","messages":[]}`
 	out := InjectPromptCacheKey([]byte(in), uid, "conv-fmt")
 	got := extractCacheKey(t, out)
-	if !strings.HasPrefix(got, "wb2a-") {
-		t.Fatalf("expected wb2a- prefix, got=%q", got)
+	if !uuidV4Re.MatchString(got) {
+		t.Fatalf("expected UUID v4 shape, got=%q", got)
 	}
-	if !strings.Contains(got, "12345678") {
-		t.Fatalf("expected uid8 (12345678) in key, got=%q", got)
+	if strings.HasPrefix(got, "wb2a-") {
+		t.Fatalf("key must not carry project prefix, got=%q", got)
+	}
+	if strings.Contains(got, "12345678") {
+		t.Fatalf("uid must not appear in plaintext, got=%q", got)
 	}
 }
 
@@ -120,11 +129,11 @@ func TestInjectPromptCacheKey_EmptyConversation(t *testing.T) {
 	if got == "" {
 		t.Fatalf("expected non-empty key when no conversation, got empty")
 	}
-	if !strings.HasPrefix(got, "wb2a-") {
-		t.Fatalf("expected wb2a- prefix, got=%q", got)
+	if !uuidV4Re.MatchString(got) {
+		t.Fatalf("expected UUID v4 shape, got=%q", got)
 	}
-	if !strings.Contains(got, "user-abc") {
-		t.Fatalf("expected uid8 in key, got=%q", got)
+	if strings.Contains(got, "user-abc") {
+		t.Fatalf("uid must not appear in plaintext, got=%q", got)
 	}
 }
 

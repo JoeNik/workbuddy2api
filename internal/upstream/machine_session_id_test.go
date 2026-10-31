@@ -1,111 +1,90 @@
 package upstream
 
 import (
-	"regexp"
 	"testing"
 
 	"workbuddy2api/internal/auth"
 )
 
-// hex36Re 36 位 hex 合法格式断言（machineId/sessionId 派生形态）。
-var hex36Re = regexp.MustCompile(`^[0-9a-f]{36}$`)
+// 本文件是「客户端从不发的头，网关也不得发」的回归锚点（issue #51）。
+//
+// 背景：旧实现按 uid 派生出 X-Machine-ID / X-Session-ID 两个 36 hex 塞进所有出站请求，
+// 理由是「每账号一台固定虚拟设备，防多号被设备指纹关联」。但真机 + 静态反编译双重确认
+// 客户端**从不发这两个头**——app.asar（main/ + renderer/）与内置 cli/dist 全量字符串里
+// `X-Machine-ID` 命中 0 次，`X-Session-ID` 只作为常量表条目存在、从不出现在出站头里；
+// 真机 chat 的 40 个出站头逐一比对也没有它们。设备标识是放在 /v2/report 的 **body** 里
+// （machineId / sessionId 字段），不是头。
+//
+// 即：这两个头不是「缺失的设备指纹」，而是「多出来的网关自造指纹」——比不发更容易被
+// 规则命中。所以断言方向与旧测试相反。
 
-// TestDeriveAccountStableIDStable 同 uid + 同用途两次派生 → 恒同值（跨重启稳定语义：
-// 固定盐纯派生，无随机源）。
-func TestDeriveAccountStableIDStable(t *testing.T) {
-	first := deriveAccountStableID("u1", "machine")
-	second := deriveAccountStableID("u1", "machine")
-	if first != second {
-		t.Errorf("deriveAccountStableID(u1, machine) unstable: %q vs %q", first, second)
+// TestCommonHeadersOmitsMachineSessionID RPC 层共享头不得携带 X-Machine-ID / X-Session-ID。
+func TestCommonHeadersOmitsMachineSessionID(t *testing.T) {
+	c := &Client{}
+	req := mustRequest(t)
+	c.CommonHeaders(req, &auth.Auth{AccessToken: "at", UID: "u1"})
+
+	if got := req.Header.Get("X-Machine-ID"); got != "" {
+		t.Errorf("X-Machine-ID = %q, want empty（客户端从不发该头）", got)
+	}
+	if got := req.Header.Get("X-Session-ID"); got != "" {
+		t.Errorf("X-Session-ID = %q, want empty（客户端从不发该头）", got)
 	}
 }
 
-// TestDeriveAccountStableIDDistinct 不同 uid → 不同值（账号间互异，防多号关联）。
-func TestDeriveAccountStableIDDistinct(t *testing.T) {
-	if deriveAccountStableID("u1", "machine") == deriveAccountStableID("u2", "machine") {
-		t.Errorf("different uids derive same machine ID")
+// TestChatHeadersOmitsMachineSessionID chat 层同样不得携带（含兜底 Del 的验证：
+// 调用方自行塞进来的也要被剥掉）。
+func TestChatHeadersOmitsMachineSessionID(t *testing.T) {
+	c := &Client{}
+	req := mustRequest(t)
+	// 模拟外部调用方先塞了这两个头，ChatHeaders 必须 Del 掉。
+	req.Header.Set("X-Machine-ID", "deadbeef")
+	req.Header.Set("X-Session-ID", "cafebabe")
+
+	c.ChatHeaders(req, &auth.Auth{AccessToken: "at", UID: "u9"}, "", ChatMeta{})
+
+	if got := req.Header.Get("X-Machine-ID"); got != "" {
+		t.Errorf("X-Machine-ID = %q, want empty after ChatHeaders", got)
+	}
+	if got := req.Header.Get("X-Session-ID"); got != "" {
+		t.Errorf("X-Session-ID = %q, want empty after ChatHeaders", got)
 	}
 }
 
-// TestDeriveAccountStableIDPurposeIsolation 同 uid + "machine" vs "session" → 不同值
-// （用途盐隔离：设备标识与账号固定会话标识不可碰撞）。
-func TestDeriveAccountStableIDPurposeIsolation(t *testing.T) {
-	if deriveAccountStableID("u1", "machine") == deriveAccountStableID("u1", "session") {
-		t.Errorf("machine/session purposes derive same ID")
-	}
-}
+// TestChatHeadersOmitsBrowserSemanticHeaders chat 不得带 Origin / Referer /
+// Accept-Language：桌面端 chat 走 node fetch / SDK，没有浏览器同源语义，真机两版
+// 逐条确认均无这三个头。
+func TestChatHeadersOmitsBrowserSemanticHeaders(t *testing.T) {
+	c := &Client{}
+	req := mustRequest(t)
+	// 外部调用方可能先按 web 层形态设过，chat 必须剥掉。
+	req.Header.Set("Origin", "https://www.workbuddy.ai")
+	req.Header.Set("Referer", "https://www.workbuddy.ai/")
+	req.Header.Set("Accept-Language", "en-US")
 
-// TestDeriveAccountStableIDFormat 输出恒为 36 hex（对齐 hub md5[:36] 同形态）。
-func TestDeriveAccountStableIDFormat(t *testing.T) {
-	for _, purpose := range []string{"machine", "session"} {
-		got := deriveAccountStableID("uid-abc", purpose)
-		if !hex36Re.MatchString(got) {
-			t.Errorf("deriveAccountStableID(%q, %q) = %q, want 36 hex", "uid-abc", purpose, got)
+	c.ChatHeaders(req, &auth.Auth{AccessToken: "at", UID: "u1"}, "", ChatMeta{})
+
+	for _, h := range []string{"Origin", "Referer", "Accept-Language"} {
+		if got := req.Header.Get(h); got != "" {
+			t.Errorf("%s = %q, want empty（桌面端 chat 不发）", h, got)
 		}
 	}
 }
 
-// TestCommonHeadersInjectsMachineSessionID CommonHeaders 后 req 携带 X-Machine-ID 与
-// X-Session-ID，且两头互异、值与直接派生一致（账号级稳定头族全出站路径覆盖）。
-func TestCommonHeadersInjectsMachineSessionID(t *testing.T) {
-	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	req := mustRequest(t)
+// TestCommonHeadersOmitsRPCOnlyAbsentHeaders RPC 层不得带 X-Requested-With /
+// X-CodeBuddy-Request / Origin / Referer / Accept-Language——这几头都是 chat 或
+// 渲染器侧另一条链专属，旧实现把它们放在 CommonHeaders 里「全出站覆盖」。
+func TestCommonHeadersOmitsRPCOnlyAbsentHeaders(t *testing.T) {
 	c := &Client{}
-	c.CommonHeaders(req, a)
-
-	machine := req.Header.Get("X-Machine-ID")
-	session := req.Header.Get("X-Session-ID")
-	if !hex36Re.MatchString(machine) {
-		t.Errorf("X-Machine-ID = %q, want 36 hex", machine)
-	}
-	if !hex36Re.MatchString(session) {
-		t.Errorf("X-Session-ID = %q, want 36 hex", session)
-	}
-	if machine != deriveAccountStableID("u1", "machine") {
-		t.Errorf("X-Machine-ID = %q, want deriveAccountStableID(u1, machine)", machine)
-	}
-	if session != deriveAccountStableID("u1", "session") {
-		t.Errorf("X-Session-ID = %q, want deriveAccountStableID(u1, session)", session)
-	}
-	if machine == session {
-		t.Errorf("X-Machine-ID == X-Session-ID (must differ by purpose salt)")
-	}
-}
-
-// TestCommonHeadersEmptyUIDSkipsInjection uid 为空（匿名请求）→ 不注入两头且不 panic。
-func TestCommonHeadersEmptyUIDSkipsInjection(t *testing.T) {
 	req := mustRequest(t)
-	c := &Client{}
-	c.CommonHeaders(req, nil)
+	c.CommonHeaders(req, &auth.Auth{AccessToken: "at", UID: "u1"})
 
-	if got := req.Header.Get("X-Machine-ID"); got != "" {
-		t.Errorf("X-Machine-ID = %q, want empty (no auth)", got)
-	}
-	if got := req.Header.Get("X-Session-ID"); got != "" {
-		t.Errorf("X-Session-ID = %q, want empty (no auth)", got)
-	}
-	req2 := mustRequest(t)
-	c.CommonHeaders(req2, &auth.Auth{AccessToken: "at", UID: ""})
-	if got := req2.Header.Get("X-Machine-ID"); got != "" {
-		t.Errorf("X-Machine-ID = %q, want empty (empty uid)", got)
-	}
-	if got := req2.Header.Get("X-Session-ID"); got != "" {
-		t.Errorf("X-Session-ID = %q, want empty (empty uid)", got)
-	}
-}
-
-// TestChatHeadersCarriesMachineSessionID ChatHeaders 走 CommonHeaders 之上叠加 →
-// 两头天然继承（chat/billing/refresh 全覆盖路径的回归锚点）。
-func TestChatHeadersCarriesMachineSessionID(t *testing.T) {
-	a := &auth.Auth{AccessToken: "at", UID: "u9"}
-	req := mustRequest(t)
-	c := &Client{}
-	c.ChatHeaders(req, a, "", ChatMeta{})
-
-	if got := req.Header.Get("X-Machine-ID"); got != deriveAccountStableID("u9", "machine") {
-		t.Errorf("X-Machine-ID = %q, want deriveAccountStableID(u9, machine)", got)
-	}
-	if got := req.Header.Get("X-Session-ID"); got != deriveAccountStableID("u9", "session") {
-		t.Errorf("X-Session-ID = %q, want deriveAccountStableID(u9, session)", got)
+	for _, h := range []string{
+		"X-Requested-With", "X-CodeBuddy-Request",
+		"Origin", "Referer", "Accept-Language",
+	} {
+		if got := req.Header.Get(h); got != "" {
+			t.Errorf("%s = %q, want empty（RPC 层不发）", h, got)
+		}
 	}
 }

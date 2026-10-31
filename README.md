@@ -75,7 +75,9 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
   - `custom`：网关用自有提示词**替换**客户端 system/developer（从源头消除模板句误报；不参与降级）
   - `append`：**两者并用**——开头连续 system/developer 块之后插入网关自有提示词，客户端项目规范/工具约定与网关人格共存（issue #129）；降级期与拦截首遇重试时退化为 `custom` 语义（换中性提示词，原文 system 移除）
   - `prompt.file`（custom/append 生效）指向自定义提示词文件，空 = 内置默认
-- **会话头族注入** — 出站携带官方客户端会话头族（`X-Conversation-Request-ID` 聚合主键 · `X-Conversation-ID` 透传 · B3 链路），轮转 / 重试 / 路径回退复用同键，后台按对话轮聚合不再碎片化（issue #35）；国际版（global）账号因 workbuddy.ai 上游强校验，三大会话头（`X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID`）按官方 Web 客户端形态固定送占位 `-`
+- **出站指纹对齐官方客户端** — 头族按**代码路径分族**而不是「全路径堆满」：chat 走 SDK 族（`WorkBuddy/<v> <brand>/<v> CLI/<cli>` + `X-Requested-With` + `X-CodeBuddy-Request` + `X-Private-Data` + `baggage` 四成员 + `b3`/`traceparent` + `acp-connection-id` + `x-stainless-*`），RPC/REST 走 RPC 族（首段即品牌 slug，不带浏览器语义头），billing 走 axios UA；客户端从不发的头（`X-Machine-ID` / `X-Session-ID` / `X-No-*` 哨兵 / `Origin` / `Referer` / `Accept-Language`）一律不发。版本段按 realm 取当前分发包（CN 5.9.3 / global 5.9.4，CLI 2.165.0）
+- **会话头族注入** — `X-Conversation-ID` 为客户端同形 UUIDv7（36 字符，透传优先、缺失则按会话键派生）、`X-Conversation-Request-ID` 为轮级聚合主键（轮转 / 重试复用同键）、`X-Conversation-Message-ID` 为消息级 32 hex（带毫秒前缀）、`X-Root-Request-ID` 为**会话根**（与轮级键不同值）、`X-Trace-ID` 独立随机（不回落轮级键），三件套齐全不发占位串（issue #35 / #51）
+- **无自证标识** — `prompt_cache_key` 与活跃上报的 conversationId 均为官方同形 UUID，不带项目前缀、不写明文账号 UID（issue #51）
 - **指纹脱敏** — 出站请求体黑名单指纹字段清洗（可开关），与提示词体系两层叠加
 
 ### 选号语义

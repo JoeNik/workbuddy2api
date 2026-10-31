@@ -70,10 +70,17 @@ func TestChatRotationReusesConversationRequestID(t *testing.T) {
 			t.Errorf("outbound %d X-Conversation-ID=%q want conv-1", i+1, got)
 		}
 	}
-	// Root = conversationRequestID。
-	for i, hdr := range reqs {
-		if got := hdr.Get("X-Root-Request-ID"); got != first {
-			t.Errorf("outbound %d X-Root-Request-ID=%q want %q", i+1, got, first)
+	// 会话根：**与轮级键不同值**（真机语义分层：根 vs 轮），但同一会话内跨轮转稳定。
+	root := reqs[0].Get("X-Root-Request-ID")
+	if root == "" {
+		t.Fatal("X-Root-Request-ID missing on outbound")
+	}
+	if root == first {
+		t.Errorf("X-Root-Request-ID must differ from ConversationRequestID (both %q)", root)
+	}
+	for i, hdr := range reqs[1:] {
+		if got := hdr.Get("X-Root-Request-ID"); got != root {
+			t.Errorf("outbound %d X-Root-Request-ID=%q want %q (session root stable)", i+2, got, root)
 		}
 	}
 	// 消息级 ID（每条消息独立）：各出站不同（每条 ChatStream 独立），格式合法且
@@ -216,12 +223,14 @@ func TestChatAGlobalPathReuseConvReqID(t *testing.T) {
 	}
 }
 
-// TestChatGlobalConversationPlaceholderHeaders global realm 端到端：国际版上游
-// 对三大会话头强校验（占位 "-"，见 upstream.conversationPlaceholder）——即便
-// body 带 conversation_id、入站带 X-Conversation-Request-ID，global 出站三头
-// 仍恒为 "-"（原来是透传/生成值 → 上游 400 code 11128「请求被拦截」）。
-// B3 链路族保持完整（无 realm 差异）。
-func TestChatGlobalConversationPlaceholderHeaders(t *testing.T) {
+// TestChatGlobalConversationHeadersRealForm global realm 端到端：会话头族必须是
+// **客户端同形态的真实值**，而不是占位串。
+//
+// 早前曾按「国际版上游要求三头恒为 `-`」的转述做过一次猜测性修复——真机抓包证明那条
+// 结论不成立：官方客户端的 X-Conversation-ID 恒为 v7 时间有序 UUID、X-Conversation-
+// Request-ID 是另一条 32 hex，三件套缺任一头才会被上游判 conversation id missing。
+// 这里锁死「透传/派生真实值」的契约，防止再退回占位。
+func TestChatGlobalConversationHeadersRealForm(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 
@@ -251,14 +260,30 @@ func TestChatGlobalConversationPlaceholderHeaders(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	for _, h := range []string{"X-Conversation-ID", "X-Conversation-Request-ID", "X-Conversation-Message-ID"} {
-		if got := captured.Get(h); got != "-" {
-			t.Errorf("global %s = %q want placeholder %q (intl 11128 gate)", h, got, "-")
+	if got := captured.Get("X-Conversation-ID"); got != "conv-1" {
+		t.Errorf("global X-Conversation-ID = %q want conv-1 (透传)", got)
+	}
+	if got := captured.Get("X-Conversation-Request-ID"); got != "client-req-1" {
+		t.Errorf("global X-Conversation-Request-ID = %q want client-req-1 (入站透传)", got)
+	}
+	msgID := captured.Get("X-Conversation-Message-ID")
+	if len(msgID) != 32 || !isValidB3Trace(msgID) {
+		t.Errorf("global X-Conversation-Message-ID = %q want 32 hex", msgID)
+	}
+	for _, hName := range []string{"X-Conversation-ID", "X-Conversation-Request-ID", "X-Conversation-Message-ID"} {
+		if got := captured.Get(hName); got == "-" {
+			t.Errorf("global %s = \"-\"（占位串已被真机形态取代）", hName)
 		}
 	}
 	if captured.Get("X-B3-TraceId") == "" || captured.Get("X-B3-SpanId") == "" {
 		t.Errorf("global B3 family missing: trace=%q span=%q",
 			captured.Get("X-B3-TraceId"), captured.Get("X-B3-SpanId"))
+	}
+	if got := captured.Get("X-Private-Data"); got != "true" {
+		t.Errorf("global X-Private-Data = %q want true (国际发行版默认关模型优化)", got)
+	}
+	if got := captured.Get("User-Agent"); got != "WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0" {
+		t.Errorf("global chat UA = %q want 5.9.4 workbuddy-ai", got)
 	}
 }
 

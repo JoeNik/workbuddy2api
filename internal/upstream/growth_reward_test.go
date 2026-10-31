@@ -307,7 +307,8 @@ func TestGrowthRedeemSendsBillingHeaders(t *testing.T) {
 	if gotAuth != "Bearer at" {
 		t.Errorf("Authorization=%q want Bearer at", gotAuth)
 	}
-	if gotReq != "1" {
-		t.Errorf("X-CodeBuddy-Request=%q want 1", gotReq)
+	// billing 域客户端**不发** X-CodeBuddy-Request（该头只属 chat 那条链）。
+	if gotReq != "" {
+		t.Errorf("X-CodeBuddy-Request=%q want empty (billing 不发)", gotReq)
 	}
 }

@@ -50,7 +50,10 @@ func TestAgentPurposeHeadersSet(t *testing.T) {
 		{"X-Agent-Purpose", "conversation"},
 		{"X-IDE-Name", "WorkBuddy"},
 		{"X-IDE-Type", "WorkBuddy"},
-		{"X-Product", "WorkBuddy"},
+		// X-Product 是 SKU 段，恒 SaaS：官方两版实测都不是产品名（issue #51）。
+		// 旧实现让它跟随 client_name，于是同一个头官方发 SaaS、网关发 WorkBuddy
+		// ——「同名不同值」比多一个头更容易被规则命中。
+		{"X-Product", "SaaS"},
 	} {
 		if got := h.Get(tc.header); got != tc.want {
 			t.Errorf("%s = %q want %q", tc.header, got, tc.want)
@@ -72,17 +75,17 @@ func TestAttributionIncludesIDEVersion(t *testing.T) {
 		{"X-IDE-Name", "WorkBuddy"},
 		{"X-IDE-Type", "WorkBuddy"},
 		{"X-IDE-Version", "6.0.0"},
-		{"X-Product", "WorkBuddy"},
+		{"X-Product", "SaaS"},
 	} {
 		if got := h.Get(tc.header); got != tc.want {
 			t.Errorf("%s = %q want %q", tc.header, got, tc.want)
 		}
 	}
-	// X-IDE-Version 缺省（client_version 空）= 内置默认 5.5.4，且四头齐全。
+	// X-IDE-Version 缺省（client_version 空）= 按 realm 的内置默认（CN 5.9.3），四头齐全。
 	c2 := &Client{ClientName: "WorkBuddy"}
 	h2 := chatHeadersReq(t, c2, a, "")
-	if got := h2.Get("X-IDE-Version"); got != "5.5.4" {
-		t.Errorf("X-IDE-Version = %q want %q (default)", got, "5.5.4")
+	if got := h2.Get("X-IDE-Version"); got != "5.9.3" {
+		t.Errorf("X-IDE-Version = %q want %q (default)", got, "5.9.3")
 	}
 	// 显式 ClientName="SaaS" 时 X-IDE-Version 不设（还原旧行为：只有 X-Product=SaaS）。
 	c3 := &Client{ClientName: "SaaS"}
@@ -99,10 +102,11 @@ func TestProductDefaultWorkBuddyFingerprint(t *testing.T) {
 	c := &Client{} // ClientName 空 → 默认 WorkBuddy 指纹
 	h := chatHeadersReq(t, c, a, "")
 	for hdr, want := range map[string]string{
-		"X-Product":       "WorkBuddy",
+		// X-Product 恒 SaaS（SKU 段），产品名只由 X-IDE-* 承载。
+		"X-Product":       "SaaS",
 		"X-IDE-Name":      "WorkBuddy",
 		"X-IDE-Type":      "WorkBuddy",
-		"X-IDE-Version":   "5.5.4",
+		"X-IDE-Version":   "5.9.3",
 		"X-Agent-Purpose": "conversation",
 	} {
 		if got := h.Get(hdr); got != want {
@@ -132,14 +136,18 @@ func TestProductWorkBuddy_WhenConfigured(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	c := &Client{ClientName: "WorkBuddy"}
 	h := chatHeadersReq(t, c, a, "")
-	if got := h.Get("X-Product"); got != "WorkBuddy" {
-		t.Errorf("X-Product = %q want %q", got, "WorkBuddy")
+	// X-Product 恒 SaaS：即使 client_name=WorkBuddy 也不跟随（官方两版实测都不是产品名）。
+	if got := h.Get("X-Product"); got != "SaaS" {
+		t.Errorf("X-Product = %q want %q", got, "SaaS")
 	}
-	// client_name 其他值也应跟随。
+	// client_name 其他值：X-IDE-* 跟随，X-Product 仍是 SaaS。
 	c2 := &Client{ClientName: "MyEditor"}
 	h2 := chatHeadersReq(t, c2, a, "")
-	if got := h2.Get("X-Product"); got != "MyEditor" {
-		t.Errorf("X-Product = %q want %q", got, "MyEditor")
+	if got := h2.Get("X-Product"); got != "SaaS" {
+		t.Errorf("X-Product = %q want %q", got, "SaaS")
+	}
+	if got := h2.Get("X-IDE-Name"); got != "MyEditor" {
+		t.Errorf("X-IDE-Name = %q want %q", got, "MyEditor")
 	}
 }
 
